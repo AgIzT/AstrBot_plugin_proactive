@@ -1,0 +1,6 @@
+name: astrbot_plugin_maibot_proactive
+desc: MaiBot 风格的 AstrBot 主动回复插件。
+help: 观察群聊和私聊消息，在不拦截 AstrBot 命令、插件和 Agent 的前提下进行主动接话。
+version: v0.1.0
+author: OpenAI Codex
+repo: https://github.com/example/astrbot_plugin_maibot_proactive

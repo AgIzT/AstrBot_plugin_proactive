@@ -1,0 +1,1 @@
+"""MaiBot proactive plugin core."""

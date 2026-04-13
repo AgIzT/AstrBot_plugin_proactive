@@ -1,0 +1,69 @@
+{
+  "enabled": {
+    "description": "启用插件",
+    "type": "bool",
+    "hint": "全局开关。关闭后插件仍可被宿主加载，但不会主动发送回复。",
+    "default": true
+  },
+  "enable_group": {
+    "description": "启用群聊主动回复",
+    "type": "bool",
+    "default": true
+  },
+  "enable_private": {
+    "description": "启用私聊轻量脑流",
+    "type": "bool",
+    "default": true
+  },
+  "fallback_provider_id": {
+    "description": "备用模型提供者",
+    "type": "string",
+    "hint": "当当前 AstrBot 会话没有绑定模型提供者时使用。",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "group_talk_value": {
+    "description": "群聊主动接话基础概率",
+    "type": "float",
+    "hint": "仅在没有明确 @ 机器人的情况下生效。",
+    "default": 0.18
+  },
+  "mention_force_reply": {
+    "description": "被提及时强制进入规划",
+    "type": "bool",
+    "default": true
+  },
+  "group_reply_cooldown_seconds": {
+    "description": "群聊主动回复冷却时间",
+    "type": "int",
+    "default": 45
+  },
+  "private_wait_default_seconds": {
+    "description": "私聊 wait 默认秒数",
+    "type": "int",
+    "default": 5
+  },
+  "max_context_messages": {
+    "description": "每个会话保留的上下文消息数",
+    "type": "int",
+    "default": 20
+  },
+  "write_back_to_conversation": {
+    "description": "将主动回复写回 AstrBot 对话历史",
+    "type": "bool",
+    "hint": "仅在当前会话已经存在 AstrBot 对话时生效。",
+    "default": true
+  },
+  "ignore_command_like_messages": {
+    "description": "忽略命令样式消息",
+    "type": "bool",
+    "hint": "以斜杠、感叹号、井号等前缀开头的消息默认不触发主动回复。",
+    "default": true
+  },
+  "blocked_origins": {
+    "description": "禁用会话列表",
+    "type": "list",
+    "hint": "填写不希望触发主动回复的 unified_msg_origin。",
+    "default": []
+  }
+}
