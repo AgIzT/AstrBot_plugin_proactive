@@ -11,6 +11,7 @@ from maibot_proactive.policy import (
     get_effective_group_talk_value,
     get_heat_factor,
     get_silence_factor,
+    should_ignore_message,
     should_observe_private,
 )
 
@@ -99,6 +100,27 @@ class PolicyTests(unittest.TestCase):
         )
         self.assertEqual(get_effective_group_talk_value(session, cfg), 0.42)
         self.assertEqual(get_effective_cooldown_seconds(session, cfg), 9)
+
+    def test_whitelist_mode_only_allows_listed_origins(self):
+        cfg = PluginConfig(
+            DummyConfig(
+                {
+                    "whitelist_origins": ["onebot:group:123"],
+                    "blocked_origins": ["onebot:group:123"],
+                }
+            )
+        )
+        allowed = build_message(unified_msg_origin="onebot:group:123")
+        blocked = build_message(unified_msg_origin="onebot:group:456")
+        self.assertFalse(should_ignore_message(allowed, cfg))
+        self.assertTrue(should_ignore_message(blocked, cfg))
+
+    def test_blacklist_is_used_when_whitelist_is_empty(self):
+        cfg = PluginConfig(DummyConfig({"blocked_origins": ["onebot:group:123"]}))
+        blocked = build_message(unified_msg_origin="onebot:group:123")
+        allowed = build_message(unified_msg_origin="onebot:group:456")
+        self.assertTrue(should_ignore_message(blocked, cfg))
+        self.assertFalse(should_ignore_message(allowed, cfg))
 
     def test_heat_activity_and_silence_factors_use_expected_bands(self):
         self.assertEqual(get_heat_factor(1), 1.0)

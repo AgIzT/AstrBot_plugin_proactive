@@ -30,6 +30,7 @@ class PluginConfig:
     pacing_no_reply_decay: float = 0.08
     pacing_frequency_min: float = 0.45
     pacing_frequency_max: float = 1.35
+    whitelist_origins: list[str] = None  # type: ignore[assignment]
     blocked_origins: list[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -78,10 +79,24 @@ class PluginConfig:
             self.pacing_frequency_min,
             float(cfg.get("pacing_frequency_max", 1.35) or 1.35),
         )
+        raw_whitelist = cfg.get("whitelist_origins", []) or []
+        if not isinstance(raw_whitelist, Iterable) or isinstance(raw_whitelist, (str, bytes)):
+            raw_whitelist = []
+        self.whitelist_origins = [
+            str(item).strip() for item in raw_whitelist if str(item).strip()
+        ]
         raw_blocked = cfg.get("blocked_origins", []) or []
         if not isinstance(raw_blocked, Iterable) or isinstance(raw_blocked, (str, bytes)):
             raw_blocked = []
         self.blocked_origins = [str(item).strip() for item in raw_blocked if str(item).strip()]
 
+    def use_whitelist_mode(self) -> bool:
+        return bool(self.whitelist_origins)
+
+    def is_allowed_origin(self, origin: str) -> bool:
+        if self.use_whitelist_mode():
+            return origin in set(self.whitelist_origins)
+        return origin not in set(self.blocked_origins)
+
     def is_blocked(self, origin: str) -> bool:
-        return origin in set(self.blocked_origins)
+        return not self.is_allowed_origin(origin)
