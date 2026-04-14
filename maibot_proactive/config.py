@@ -22,6 +22,14 @@ class PluginConfig:
     duplicate_reply_window_seconds: int = 180
     log_decisions: bool = True
     ignore_low_signal_messages: bool = True
+    pacing_activity_window_seconds: int = 90
+    pacing_recovery_after_seconds: int = 600
+    pacing_mention_boost: float = 0.20
+    pacing_activity_boost: float = 0.06
+    pacing_reply_decay: float = 0.18
+    pacing_no_reply_decay: float = 0.08
+    pacing_frequency_min: float = 0.45
+    pacing_frequency_max: float = 1.35
     blocked_origins: list[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -50,6 +58,26 @@ class PluginConfig:
         )
         self.log_decisions = bool(cfg.get("log_decisions", True))
         self.ignore_low_signal_messages = bool(cfg.get("ignore_low_signal_messages", True))
+        self.pacing_activity_window_seconds = max(
+            10,
+            int(cfg.get("pacing_activity_window_seconds", 90) or 90),
+        )
+        self.pacing_recovery_after_seconds = max(
+            60,
+            int(cfg.get("pacing_recovery_after_seconds", 600) or 600),
+        )
+        self.pacing_mention_boost = max(0.0, float(cfg.get("pacing_mention_boost", 0.20) or 0.20))
+        self.pacing_activity_boost = max(0.0, float(cfg.get("pacing_activity_boost", 0.06) or 0.06))
+        self.pacing_reply_decay = max(0.0, float(cfg.get("pacing_reply_decay", 0.18) or 0.18))
+        self.pacing_no_reply_decay = max(0.0, float(cfg.get("pacing_no_reply_decay", 0.08) or 0.08))
+        self.pacing_frequency_min = max(
+            0.05,
+            float(cfg.get("pacing_frequency_min", 0.45) or 0.45),
+        )
+        self.pacing_frequency_max = max(
+            self.pacing_frequency_min,
+            float(cfg.get("pacing_frequency_max", 1.35) or 1.35),
+        )
         raw_blocked = cfg.get("blocked_origins", []) or []
         if not isinstance(raw_blocked, Iterable) or isinstance(raw_blocked, (str, bytes)):
             raw_blocked = []

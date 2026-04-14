@@ -82,6 +82,48 @@
     "hint": "像纯表情、纯媒体标记、过短重复消息默认不触发主动回复。",
     "default": true
   },
+  "pacing_activity_window_seconds": {
+    "description": "节奏活跃窗口秒数",
+    "type": "int",
+    "hint": "用于统计群聊最近活跃度的时间窗口。",
+    "default": 90
+  },
+  "pacing_recovery_after_seconds": {
+    "description": "节奏恢复阈值秒数",
+    "type": "int",
+    "hint": "超过该时长未活跃时，会逐步恢复主动回复节奏。",
+    "default": 600
+  },
+  "pacing_mention_boost": {
+    "description": "提及节奏增益",
+    "type": "float",
+    "default": 0.2
+  },
+  "pacing_activity_boost": {
+    "description": "热聊节奏增益",
+    "type": "float",
+    "default": 0.06
+  },
+  "pacing_reply_decay": {
+    "description": "成功回复后的节奏衰减",
+    "type": "float",
+    "default": 0.18
+  },
+  "pacing_no_reply_decay": {
+    "description": "沉默或失败后的节奏衰减",
+    "type": "float",
+    "default": 0.08
+  },
+  "pacing_frequency_min": {
+    "description": "节奏乘子最小值",
+    "type": "float",
+    "default": 0.45
+  },
+  "pacing_frequency_max": {
+    "description": "节奏乘子最大值",
+    "type": "float",
+    "default": 1.35
+  },
   "blocked_origins": {
     "description": "禁用会话列表",
     "type": "list",

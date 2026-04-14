@@ -6,8 +6,8 @@ import threading
 import time
 from pathlib import Path
 
-from .models import ActionPlan, ActionRecord, NormalizedMessage, SessionRecord
-from .policy import clamp_talk_frequency_adjust
+from .models import ActionPlan, ActionRecord, GroupPacingStats, NormalizedMessage, SessionRecord
+from .policy import RECOVERY_STEP, clamp_talk_frequency_adjust
 
 
 class SQLiteStateStore:
@@ -85,10 +85,7 @@ class SQLiteStateStore:
             self._ensure_column(conn, "action_records", "payload_summary", "TEXT NOT NULL DEFAULT ''")
 
     def _ensure_column(self, conn: sqlite3.Connection, table_name: str, column_name: str, ddl: str) -> None:
-        columns = {
-            row["name"]
-            for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-        }
+        columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
         if column_name not in columns:
             conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}")
 
@@ -183,11 +180,7 @@ class SQLiteStateStore:
                 (message.unified_msg_origin, keep_count),
             )
 
-    async def has_recent_duplicate_message(
-        self,
-        message: NormalizedMessage,
-        within_seconds: int = 30,
-    ) -> bool:
+    async def has_recent_duplicate_message(self, message: NormalizedMessage, within_seconds: int = 30) -> bool:
         return await asyncio.to_thread(self._has_recent_duplicate_message_sync, message, within_seconds)
 
     def _has_recent_duplicate_message_sync(self, message: NormalizedMessage, within_seconds: int) -> bool:
@@ -230,24 +223,64 @@ class SQLiteStateStore:
             ).fetchall()
         return [self._row_to_message(origin, row) for row in rows]
 
-    async def count_unread_human_messages(self, origin: str, since: float) -> int:
-        return await asyncio.to_thread(self._count_unread_human_messages_sync, origin, since)
+    async def get_group_pacing_stats(
+        self,
+        origin: str,
+        since_read: float,
+        activity_window_start: float,
+    ) -> GroupPacingStats:
+        return await asyncio.to_thread(self._get_group_pacing_stats_sync, origin, since_read, activity_window_start)
 
-    def _count_unread_human_messages_sync(self, origin: str, since: float) -> int:
+    def _get_group_pacing_stats_sync(
+        self,
+        origin: str,
+        since_read: float,
+        activity_window_start: float,
+    ) -> GroupPacingStats:
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT COUNT(*) AS cnt
+                SELECT
+                    SUM(
+                        CASE
+                            WHEN is_bot = 0
+                             AND is_command_like = 0
+                             AND is_low_signal = 0
+                             AND created_at > ?
+                            THEN 1 ELSE 0
+                        END
+                    ) AS unread_count,
+                    SUM(
+                        CASE
+                            WHEN is_bot = 0
+                             AND is_command_like = 0
+                             AND is_low_signal = 0
+                             AND created_at >= ?
+                            THEN 1 ELSE 0
+                        END
+                    ) AS activity_count,
+                    MAX(
+                        CASE
+                            WHEN is_bot = 0
+                             AND is_command_like = 0
+                             AND is_low_signal = 0
+                            THEN created_at ELSE NULL
+                        END
+                    ) AS latest_human_message_at
                 FROM recent_messages
                 WHERE unified_msg_origin = ?
-                  AND created_at > ?
-                  AND is_bot = 0
-                  AND is_command_like = 0
-                  AND is_low_signal = 0
                 """,
-                (origin, since),
+                (since_read, activity_window_start, origin),
             ).fetchone()
-        return int(row["cnt"]) if row else 0
+        return GroupPacingStats(
+            unread_human_messages=int(row["unread_count"] or 0) if row else 0,
+            recent_activity_messages=int(row["activity_count"] or 0) if row else 0,
+            latest_human_message_at=float(row["latest_human_message_at"] or 0.0) if row else 0.0,
+        )
+
+    async def count_unread_human_messages(self, origin: str, since: float) -> int:
+        stats = await self.get_group_pacing_stats(origin, since_read=since, activity_window_start=0.0)
+        return stats.unread_human_messages
 
     async def add_action_record(self, origin: str, plan: ActionPlan, created_at: float | None = None) -> None:
         await asyncio.to_thread(self._add_action_record_sync, origin, plan, created_at or time.time())
@@ -375,22 +408,106 @@ class SQLiteStateStore:
                 (origin,),
             )
 
-    async def adjust_talk_frequency(self, origin: str, delta: float) -> float:
-        return await asyncio.to_thread(self._adjust_talk_frequency_sync, origin, delta)
+    async def reset_consecutive_no_reply(self, origin: str) -> None:
+        await asyncio.to_thread(self._reset_consecutive_no_reply_sync, origin)
 
-    def _adjust_talk_frequency_sync(self, origin: str, delta: float) -> float:
+    def _reset_consecutive_no_reply_sync(self, origin: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE chat_sessions SET consecutive_no_reply_count = 0 WHERE unified_msg_origin = ?",
+                (origin,),
+            )
+
+    async def adjust_talk_frequency(
+        self,
+        origin: str,
+        delta: float,
+        minimum: float,
+        maximum: float,
+    ) -> float:
+        return await asyncio.to_thread(self._adjust_talk_frequency_sync, origin, delta, minimum, maximum)
+
+    def _adjust_talk_frequency_sync(self, origin: str, delta: float, minimum: float, maximum: float) -> float:
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 "SELECT talk_frequency_adjust FROM chat_sessions WHERE unified_msg_origin = ?",
                 (origin,),
             ).fetchone()
             current = float(row["talk_frequency_adjust"]) if row else 1.0
-            updated = clamp_talk_frequency_adjust(current + delta)
+            updated = clamp_talk_frequency_adjust(current + delta, minimum=minimum, maximum=maximum)
             conn.execute(
                 "UPDATE chat_sessions SET talk_frequency_adjust = ? WHERE unified_msg_origin = ?",
                 (updated, origin),
             )
         return updated
+
+    async def recover_group_pacing(
+        self,
+        origin: str,
+        now: float,
+        recovery_after_seconds: int,
+        minimum: float,
+        maximum: float,
+    ) -> SessionRecord:
+        return await asyncio.to_thread(
+            self._recover_group_pacing_sync,
+            origin,
+            now,
+            recovery_after_seconds,
+            minimum,
+            maximum,
+        )
+
+    def _recover_group_pacing_sync(
+        self,
+        origin: str,
+        now: float,
+        recovery_after_seconds: int,
+        minimum: float,
+        maximum: float,
+    ) -> SessionRecord:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM chat_sessions WHERE unified_msg_origin = ?",
+                (origin,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"session-not-found: {origin}")
+
+            last_active_at = float(row["last_active_at"] or 0.0)
+            last_read_at = float(row["last_read_at"] or 0.0)
+            talk_frequency_adjust = float(row["talk_frequency_adjust"] or 1.0)
+            new_no_reply_count = int(row["consecutive_no_reply_count"] or 0)
+
+            last_signal_at = max(last_active_at, last_read_at)
+            if last_signal_at and (now - last_signal_at) >= recovery_after_seconds:
+                new_no_reply_count = 0
+
+            updated_frequency = talk_frequency_adjust
+            if last_active_at and (now - last_active_at) >= recovery_after_seconds and talk_frequency_adjust < 1.0:
+                updated_frequency = min(
+                    1.0,
+                    clamp_talk_frequency_adjust(
+                        talk_frequency_adjust + RECOVERY_STEP,
+                        minimum=minimum,
+                        maximum=maximum,
+                    ),
+                )
+
+            conn.execute(
+                """
+                UPDATE chat_sessions
+                SET consecutive_no_reply_count = ?,
+                    talk_frequency_adjust = ?
+                WHERE unified_msg_origin = ?
+                """,
+                (new_no_reply_count, updated_frequency, origin),
+            )
+            updated_row = conn.execute(
+                "SELECT * FROM chat_sessions WHERE unified_msg_origin = ?",
+                (origin,),
+            ).fetchone()
+        return self._row_to_session(updated_row)  # type: ignore[arg-type]
 
     async def is_duplicate_reply(
         self,

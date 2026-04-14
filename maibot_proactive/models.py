@@ -60,3 +60,10 @@ class ActionRecord:
     target_message_id: str
     created_at: float
     payload_summary: str = ""
+
+
+@dataclass(slots=True)
+class GroupPacingStats:
+    unread_human_messages: int = 0
+    recent_activity_messages: int = 0
+    latest_human_message_at: float = 0.0

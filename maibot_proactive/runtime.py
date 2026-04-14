@@ -13,11 +13,13 @@ from astrbot.api.event import MessageChain
 from astrbot.core.agent.message import AssistantMessageSegment, TextPart, UserMessageSegment
 
 from .config import PluginConfig
-from .models import ActionPlan, NormalizedMessage, SessionRecord
+from .models import ActionPlan, GroupPacingStats, NormalizedMessage, SessionRecord
 from .planner import PlannerEngine
 from .policy import (
+    PacingSnapshot,
     compute_group_trigger,
     get_effective_cooldown_seconds,
+    is_hot_activity,
     is_low_signal_message,
     should_observe_private,
 )
@@ -56,7 +58,7 @@ class MaiBotProactiveService:
         if not message:
             return
 
-        session = await self.store.upsert_session(message)
+        await self.store.upsert_session(message)
         if not message.is_mentioned and await self.store.has_recent_duplicate_message(message, within_seconds=30):
             message.is_low_signal = True
 
@@ -68,39 +70,63 @@ class MaiBotProactiveService:
             self._log(origin=message.unified_msg_origin, detail="wait interrupted by new private message")
 
         if message.chat_type == "group":
-            await self._handle_group_message(message, session)
+            await self._handle_group_message(message)
         else:
-            await self._handle_private_message(message, session)
+            await self._handle_private_message(message)
 
-    async def _handle_group_message(self, message: NormalizedMessage, session: SessionRecord) -> None:
+    async def _handle_group_message(self, message: NormalizedMessage) -> None:
         now = time.time()
-        unread_count = await self.store.count_unread_human_messages(
-            message.unified_msg_origin,
-            session.last_read_at,
+        session = await self.store.get_session(message.unified_msg_origin, "group")
+        effective_human_message = not message.is_command_like and not message.is_low_signal
+
+        if effective_human_message:
+            session = await self.store.recover_group_pacing(
+                origin=message.unified_msg_origin,
+                now=now,
+                recovery_after_seconds=self.config.pacing_recovery_after_seconds,
+                minimum=self.config.pacing_frequency_min,
+                maximum=self.config.pacing_frequency_max,
+            )
+
+        pacing_stats = await self.store.get_group_pacing_stats(
+            origin=message.unified_msg_origin,
+            since_read=session.last_read_at,
+            activity_window_start=now - self.config.pacing_activity_window_seconds,
         )
 
-        if message.is_mentioned:
-            await self.store.adjust_talk_frequency(message.unified_msg_origin, 0.20)
+        if effective_human_message and message.is_mentioned:
+            await self._adjust_group_pacing(message.unified_msg_origin, self.config.pacing_mention_boost)
             session = await self.store.get_session(message.unified_msg_origin, "group")
-        elif unread_count >= 2 and not self._is_group_in_cooldown(session, now):
-            await self.store.adjust_talk_frequency(message.unified_msg_origin, 0.05)
+        elif (
+            effective_human_message
+            and is_hot_activity(pacing_stats.recent_activity_messages)
+            and not self._is_group_in_cooldown(session, now)
+        ):
+            await self._adjust_group_pacing(message.unified_msg_origin, self.config.pacing_activity_boost)
             session = await self.store.get_session(message.unified_msg_origin, "group")
 
         decision = compute_group_trigger(
             message=message,
             session=session,
-            unread_human_messages=unread_count,
+            pacing_stats=pacing_stats,
             config=self.config,
             random_value=random.random(),
             now=now,
         )
-        self._log_trigger(message, decision.reason, unread_count, decision.effective_talk_value, decision.heat_factor)
+        self._log_group_trigger(message, pacing_stats, decision.snapshot, decision)
         if decision.should_observe:
             await self._schedule_observation(message.unified_msg_origin, "group", decision.reason)
 
-    async def _handle_private_message(self, message: NormalizedMessage, session: SessionRecord) -> None:
+    async def _handle_private_message(self, message: NormalizedMessage) -> None:
+        session = await self.store.get_session(message.unified_msg_origin, "private")
         decision = should_observe_private(message, self.config, session=session)
-        self._log_trigger(message, decision.reason, 1, decision.effective_talk_value, decision.heat_factor)
+        if self.config.log_decisions:
+            logger.info(
+                "[maibot_proactive] origin=%s type=%s reason=%s",
+                message.unified_msg_origin,
+                message.chat_type,
+                decision.reason,
+            )
         if decision.should_observe:
             await self._schedule_observation(message.unified_msg_origin, "private", decision.reason)
 
@@ -122,16 +148,15 @@ class MaiBotProactiveService:
             now = time.time()
             await self.store.mark_observed(origin, now)
             messages = await self.store.get_recent_messages(origin, self.config.max_context_messages)
-            session = await self.store.get_session(origin, chat_type)
             if not messages:
                 return
 
             provider_id = await self._get_provider_id(origin)
             if not provider_id:
-                logger.warning(f"No provider available for proactive reply: {origin}")
+                logger.warning("No provider available for proactive reply: %s", origin)
                 if chat_type == "group":
                     await self.store.increment_no_reply(origin)
-                    await self.store.adjust_talk_frequency(origin, -0.08)
+                    await self._adjust_group_pacing(origin, -self.config.pacing_no_reply_decay)
                 else:
                     await self.store.clear_waiting(origin)
                 return
@@ -165,7 +190,7 @@ class MaiBotProactiveService:
             else:
                 await self.store.increment_no_reply(origin)
                 if chat_type == "group":
-                    await self.store.adjust_talk_frequency(origin, -0.08)
+                    await self._adjust_group_pacing(origin, -self.config.pacing_no_reply_decay)
                 self._log(origin=origin, detail="planner chose no_reply")
 
         if origin in self._pending_reobserve:
@@ -184,7 +209,7 @@ class MaiBotProactiveService:
         if not reply_text:
             if chat_type == "group":
                 await self.store.increment_no_reply(origin)
-                await self.store.adjust_talk_frequency(origin, -0.08)
+                await self._adjust_group_pacing(origin, -self.config.pacing_no_reply_decay)
             else:
                 wait_seconds = self.config.private_wait_default_seconds
                 await self.store.set_waiting(origin, time.time() + wait_seconds)
@@ -202,7 +227,7 @@ class MaiBotProactiveService:
             )
             if is_duplicate:
                 await self.store.increment_no_reply(origin)
-                await self.store.adjust_talk_frequency(origin, -0.08)
+                await self._adjust_group_pacing(origin, -self.config.pacing_no_reply_decay)
                 self._log(origin=origin, detail="duplicate reply suppressed")
                 return
 
@@ -230,11 +255,19 @@ class MaiBotProactiveService:
             reply_text_hash=reply_hash,
         )
         if chat_type == "group":
-            await self.store.adjust_talk_frequency(origin, -0.18)
+            await self._adjust_group_pacing(origin, -self.config.pacing_reply_decay)
         if self.config.write_back_to_conversation:
             target_message = self._resolve_write_back_target(messages, plan)
             if target_message is not None:
                 await self._write_back_to_conversation(origin, target_message, reply_text)
+
+    async def _adjust_group_pacing(self, origin: str, delta: float) -> float:
+        return await self.store.adjust_talk_frequency(
+            origin=origin,
+            delta=delta,
+            minimum=self.config.pacing_frequency_min,
+            maximum=self.config.pacing_frequency_max,
+        )
 
     def _arm_wait(self, origin: str, wait_seconds: int) -> None:
         if origin in self._wait_tasks:
@@ -271,7 +304,7 @@ class MaiBotProactiveService:
                 llm_call=lambda prompt: self._llm_call(provider_id, prompt),
             )
         except Exception as exc:
-            logger.exception(f"Reply generation failed: {exc}")
+            logger.exception("Reply generation failed: %s", exc)
             return ""
 
     def _resolve_write_back_target(
@@ -436,28 +469,43 @@ class MaiBotProactiveService:
         normalized.is_low_signal = is_low_signal_message(normalized)
         return normalized
 
-    def _log_trigger(
+    def _log_group_trigger(
         self,
         message: NormalizedMessage,
-        reason: str,
-        unread_count: int,
-        effective_talk_value: float,
-        heat_factor: float,
+        pacing_stats: GroupPacingStats,
+        snapshot: PacingSnapshot | None,
+        decision: Any,
     ) -> None:
         if not self.config.log_decisions:
             return
+
+        if snapshot is None:
+            logger.info(
+                "[maibot_proactive] origin=%s type=%s reason=%s",
+                message.unified_msg_origin,
+                message.chat_type,
+                decision.reason,
+            )
+            return
+
         logger.info(
-            "[maibot_proactive] origin=%s type=%s mentioned=%s low_signal=%s unread=%s reason=%s chance=%.3f heat=%.2f",
+            "[maibot_proactive] origin=%s type=%s reason=%s freq=%.3f heat=%.2f activity=%.2f silence=%.2f chance=%.3f unread=%s activity_count=%s cooldown=%s threshold=%s probability=%s tags=%s",
             message.unified_msg_origin,
             message.chat_type,
-            message.is_mentioned,
-            message.is_low_signal,
-            unread_count,
-            reason,
-            effective_talk_value,
-            heat_factor,
+            decision.reason,
+            snapshot.talk_frequency_adjust,
+            snapshot.heat_factor,
+            snapshot.activity_factor,
+            snapshot.silence_factor,
+            snapshot.effective_probability,
+            pacing_stats.unread_human_messages,
+            pacing_stats.recent_activity_messages,
+            decision.cooldown_hit,
+            decision.unread_threshold_hit,
+            decision.probability_hit,
+            ",".join(snapshot.reason_tags),
         )
 
     def _log(self, origin: str, detail: str) -> None:
         if self.config.log_decisions:
-            logger.info(f"[maibot_proactive] origin={origin} {detail}")
+            logger.info("[maibot_proactive] origin=%s %s", origin, detail)
