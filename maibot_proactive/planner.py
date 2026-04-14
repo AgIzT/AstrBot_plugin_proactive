@@ -41,6 +41,12 @@ class PlannerEngine:
             for msg in messages[-self.config.max_context_messages :]
         )
         history = "\n".join(actions_before_now[-5:]) or "none"
+        target = self._select_default_target_message(messages)
+        target_block = (
+            f"{target.message_id} | {target.sender_name}: {target.raw_summary}"
+            if target is not None
+            else "none"
+        )
         actions_text = (
             "Allowed action values:\n1. reply\n2. no_reply\n"
             if chat_type == "group"
@@ -50,7 +56,8 @@ class PlannerEngine:
         return (
             "You are a cautious proactive reply planner inside AstrBot.\n"
             f"Current chat type: {'group' if chat_type == 'group' else 'private'}\n"
-            f"Trigger reason: {trigger_reason}\n"
+            f"Trigger reason: {trigger_reason}\n\n"
+            f"Target message candidate:\n{target_block}\n\n"
             f"Recent action history:\n{history}\n\n"
             f"Recent chat messages:\n{conversation}\n\n"
             f"{actions_text}\n"
@@ -59,6 +66,7 @@ class PlannerEngine:
             "- Never reply to the bot's own message.\n"
             "- Group replies must be brief and non-disruptive.\n"
             "- When choosing reply, you may also provide unknown_words, question, and quote.\n"
+            "- quote can only be true when replying to a human message.\n"
             "- Output exactly one JSON object and nothing else.\n"
             "JSON schema:\n"
             "{\"action\":\"reply|no_reply|wait|complete_talk\",\"target_message_id\":\"message-id\",\"reason\":\"short reason\",\"unknown_words\":[\"term\"],\"question\":\"search hint\",\"quote\":false,\"wait_seconds\":5}"
@@ -72,31 +80,32 @@ class PlannerEngine:
             if action not in allowed:
                 return self._fallback_plan(chat_type, messages, "invalid-action")
 
-            target_message_id = str(payload.get("target_message_id", "") or "").strip()
-            if not target_message_id and messages:
-                target_message_id = messages[-1].message_id
-
-            target_message = next((msg for msg in messages if msg.message_id == target_message_id), None)
+            target_message = self._resolve_target_message(messages, str(payload.get("target_message_id", "") or "").strip())
+            if action == "reply" and target_message is None:
+                return self._fallback_plan(chat_type, messages, "missing-target")
             if action == "reply" and target_message and target_message.is_bot:
                 return self._fallback_plan(chat_type, messages, "self-target")
 
             reason = str(payload.get("reason", "") or "").strip() or "planner"
             unknown_words = _clean_string_list(payload.get("unknown_words"))
             question = str(payload.get("question", "") or "").strip()
-            quote = bool(payload.get("quote", False))
-            wait_seconds = _normalize_wait_seconds(payload.get("wait_seconds", 0), self.config.private_wait_default_seconds)
+            quote = bool(payload.get("quote", False)) and bool(target_message and not target_message.is_bot)
+            wait_seconds = _normalize_wait_seconds(
+                payload.get("wait_seconds", 0),
+                self.config.private_wait_default_seconds,
+            )
 
             if action == "wait":
                 return ActionPlan(
                     action="wait",
-                    target_message_id=target_message_id,
+                    target_message_id=target_message.message_id if target_message else "",
                     reason=reason,
                     wait_seconds=wait_seconds,
                 )
 
             return ActionPlan(
                 action=action,  # type: ignore[arg-type]
-                target_message_id=target_message_id,
+                target_message_id=target_message.message_id if target_message else "",
                 reason=reason,
                 unknown_words=unknown_words,
                 question=question,
@@ -106,18 +115,37 @@ class PlannerEngine:
             return self._fallback_plan(chat_type, messages, "parse-failed")
 
     def _fallback_plan(self, chat_type: str, messages: list[NormalizedMessage], reason: str) -> ActionPlan:
+        target = self._select_default_target_message(messages)
         if chat_type == "private":
             return ActionPlan(
                 action="wait",
-                target_message_id=messages[-1].message_id if messages else "",
+                target_message_id=target.message_id if target else "",
                 reason=reason,
                 wait_seconds=self.config.private_wait_default_seconds,
             )
         return ActionPlan(
             action="no_reply",
-            target_message_id=messages[-1].message_id if messages else "",
+            target_message_id=target.message_id if target else "",
             reason=reason,
         )
+
+    def _resolve_target_message(
+        self,
+        messages: list[NormalizedMessage],
+        target_message_id: str,
+    ) -> NormalizedMessage | None:
+        if target_message_id:
+            target = next((msg for msg in messages if msg.message_id == target_message_id), None)
+            if target and not target.is_bot and not target.is_command_like:
+                return target
+        return self._select_default_target_message(messages)
+
+    def _select_default_target_message(self, messages: list[NormalizedMessage]) -> NormalizedMessage | None:
+        for message in reversed(messages):
+            if message.is_bot or message.is_command_like:
+                continue
+            return message
+        return None
 
     def _extract_json(self, raw_output: str) -> dict:
         fenced_match = re.search(r"```json\s*(\{.*?\})\s*```", raw_output, re.DOTALL)

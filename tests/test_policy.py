@@ -2,7 +2,14 @@ import unittest
 
 from maibot_proactive.config import PluginConfig
 from maibot_proactive.models import NormalizedMessage, SessionRecord
-from maibot_proactive.policy import compute_group_trigger, should_observe_private
+from maibot_proactive.policy import (
+    clamp_talk_frequency_adjust,
+    compute_group_trigger,
+    get_effective_cooldown_seconds,
+    get_effective_group_talk_value,
+    get_heat_factor,
+    should_observe_private,
+)
 
 
 class DummyConfig(dict):
@@ -24,6 +31,7 @@ def build_message(**overrides):
         "is_bot": False,
         "is_mentioned": False,
         "is_command_like": False,
+        "is_low_signal": False,
     }
     data.update(overrides)
     return NormalizedMessage(**data)
@@ -51,6 +59,39 @@ class PolicyTests(unittest.TestCase):
         msg = build_message(chat_type="private", unified_msg_origin="onebot:private:1")
         decision = should_observe_private(msg, cfg)
         self.assertTrue(decision.should_observe)
+
+    def test_low_signal_private_message_is_ignored(self):
+        cfg = PluginConfig(DummyConfig())
+        msg = build_message(
+            chat_type="private",
+            unified_msg_origin="onebot:private:1",
+            raw_summary="[emoji]",
+            is_low_signal=True,
+        )
+        decision = should_observe_private(msg, cfg)
+        self.assertFalse(decision.should_observe)
+        self.assertEqual(decision.reason, "ignored")
+
+    def test_group_uses_session_override_values(self):
+        cfg = PluginConfig(DummyConfig())
+        session = SessionRecord(
+            "onebot:group:123",
+            "group",
+            talk_value_override=0.42,
+            cooldown_override=9,
+        )
+        self.assertEqual(get_effective_group_talk_value(session, cfg), 0.42)
+        self.assertEqual(get_effective_cooldown_seconds(session, cfg), 9)
+
+    def test_heat_factor_scales_with_unread_messages(self):
+        self.assertEqual(get_heat_factor(1), 1.0)
+        self.assertEqual(get_heat_factor(2), 1.08)
+        self.assertEqual(get_heat_factor(3), 1.15)
+
+    def test_talk_frequency_clamp_has_bounds(self):
+        self.assertEqual(clamp_talk_frequency_adjust(0.1), 0.45)
+        self.assertEqual(clamp_talk_frequency_adjust(2.0), 1.35)
+        self.assertEqual(clamp_talk_frequency_adjust(1.1), 1.1)
 
 
 if __name__ == "__main__":

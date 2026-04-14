@@ -2,7 +2,7 @@
   "enabled": {
     "description": "启用插件",
     "type": "bool",
-    "hint": "全局开关。关闭后插件仍可被宿主加载，但不会主动发送回复。",
+    "hint": "全局开关。关闭后插件不会主动发送回复。",
     "default": true
   },
   "enable_group": {
@@ -58,6 +58,28 @@
     "description": "忽略命令样式消息",
     "type": "bool",
     "hint": "以斜杠、感叹号、井号等前缀开头的消息默认不触发主动回复。",
+    "default": true
+  },
+  "enable_session_overrides": {
+    "description": "启用会话级覆盖",
+    "type": "bool",
+    "hint": "允许单个会话覆盖全局节奏配置。",
+    "default": true
+  },
+  "duplicate_reply_window_seconds": {
+    "description": "重复回复抑制窗口秒数",
+    "type": "int",
+    "default": 180
+  },
+  "log_decisions": {
+    "description": "记录详细决策日志",
+    "type": "bool",
+    "default": true
+  },
+  "ignore_low_signal_messages": {
+    "description": "忽略低信息量消息",
+    "type": "bool",
+    "hint": "像纯表情、纯媒体标记、过短重复消息默认不触发主动回复。",
     "default": true
   },
   "blocked_origins": {

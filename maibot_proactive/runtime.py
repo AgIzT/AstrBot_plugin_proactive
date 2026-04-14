@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import random
 import time
 import uuid
@@ -12,9 +13,14 @@ from astrbot.api.event import MessageChain
 from astrbot.core.agent.message import AssistantMessageSegment, TextPart, UserMessageSegment
 
 from .config import PluginConfig
-from .models import NormalizedMessage
+from .models import ActionPlan, NormalizedMessage, SessionRecord
 from .planner import PlannerEngine
-from .policy import compute_group_trigger, should_ignore_message, should_observe_private
+from .policy import (
+    compute_group_trigger,
+    get_effective_cooldown_seconds,
+    is_low_signal_message,
+    should_observe_private,
+)
 from .reply import ReplyEngine
 from .store import SQLiteStateStore
 
@@ -51,59 +57,88 @@ class MaiBotProactiveService:
             return
 
         session = await self.store.upsert_session(message)
+        if not message.is_mentioned and await self.store.has_recent_duplicate_message(message, within_seconds=30):
+            message.is_low_signal = True
+
         await self.store.save_message(message, self.config.max_context_messages)
 
         if message.chat_type == "private" and message.unified_msg_origin in self._wait_tasks:
             self._wait_tasks.pop(message.unified_msg_origin).cancel()
             await self.store.clear_waiting(message.unified_msg_origin)
+            self._log(origin=message.unified_msg_origin, detail="wait interrupted by new private message")
 
         if message.chat_type == "group":
-            unread_count = await self.store.count_unread_human_messages(
-                message.unified_msg_origin,
-                session.last_read_at,
-            )
-            decision = compute_group_trigger(
-                message=message,
-                session=session,
-                unread_human_messages=unread_count,
-                config=self.config,
-                random_value=random.random(),
-                now=time.time(),
-            )
-            if decision.should_observe:
-                await self._schedule_observation(message.unified_msg_origin, "group", decision.reason)
+            await self._handle_group_message(message, session)
         else:
-            decision = should_observe_private(message, self.config)
-            if decision.should_observe:
-                await self._schedule_observation(message.unified_msg_origin, "private", decision.reason)
+            await self._handle_private_message(message, session)
+
+    async def _handle_group_message(self, message: NormalizedMessage, session: SessionRecord) -> None:
+        now = time.time()
+        unread_count = await self.store.count_unread_human_messages(
+            message.unified_msg_origin,
+            session.last_read_at,
+        )
+
+        if message.is_mentioned:
+            await self.store.adjust_talk_frequency(message.unified_msg_origin, 0.20)
+            session = await self.store.get_session(message.unified_msg_origin, "group")
+        elif unread_count >= 2 and not self._is_group_in_cooldown(session, now):
+            await self.store.adjust_talk_frequency(message.unified_msg_origin, 0.05)
+            session = await self.store.get_session(message.unified_msg_origin, "group")
+
+        decision = compute_group_trigger(
+            message=message,
+            session=session,
+            unread_human_messages=unread_count,
+            config=self.config,
+            random_value=random.random(),
+            now=now,
+        )
+        self._log_trigger(message, decision.reason, unread_count, decision.effective_talk_value, decision.heat_factor)
+        if decision.should_observe:
+            await self._schedule_observation(message.unified_msg_origin, "group", decision.reason)
+
+    async def _handle_private_message(self, message: NormalizedMessage, session: SessionRecord) -> None:
+        decision = should_observe_private(message, self.config, session=session)
+        self._log_trigger(message, decision.reason, 1, decision.effective_talk_value, decision.heat_factor)
+        if decision.should_observe:
+            await self._schedule_observation(message.unified_msg_origin, "private", decision.reason)
+
+    def _is_group_in_cooldown(self, session: SessionRecord, now: float) -> bool:
+        cooldown_seconds = get_effective_cooldown_seconds(session, self.config)
+        return bool(session.last_active_at and (now - session.last_active_at) < cooldown_seconds)
 
     async def _schedule_observation(self, origin: str, chat_type: str, trigger_reason: str) -> None:
         lock = self._observe_locks.setdefault(origin, asyncio.Lock())
         if lock.locked():
             self._pending_reobserve.add(origin)
+            self._log(origin=origin, detail=f"observation queued ({chat_type}, {trigger_reason})")
             return
         asyncio.create_task(self._observe(origin, chat_type, trigger_reason))
 
     async def _observe(self, origin: str, chat_type: str, trigger_reason: str) -> None:
         lock = self._observe_locks.setdefault(origin, asyncio.Lock())
         async with lock:
-            await self.store.mark_observed(origin, time.time())
+            now = time.time()
+            await self.store.mark_observed(origin, now)
             messages = await self.store.get_recent_messages(origin, self.config.max_context_messages)
+            session = await self.store.get_session(origin, chat_type)
             if not messages:
                 return
 
             provider_id = await self._get_provider_id(origin)
             if not provider_id:
-                logger.warning("No provider available for proactive reply: %s", origin)
+                logger.warning(f"No provider available for proactive reply: {origin}")
                 if chat_type == "group":
                     await self.store.increment_no_reply(origin)
+                    await self.store.adjust_talk_frequency(origin, -0.08)
                 else:
                     await self.store.clear_waiting(origin)
                 return
 
             recent_actions = await self.store.get_recent_actions(origin, limit=5)
             action_lines = [
-                f"{record.action} | {record.reason} | {record.target_message_id}"
+                f"{record.action} | {record.reason} | {record.target_message_id} | {record.payload_summary}"
                 for record in reversed(recent_actions)
             ]
 
@@ -115,48 +150,91 @@ class MaiBotProactiveService:
                 llm_call=lambda prompt: self._llm_call(provider_id, prompt),
             )
             await self.store.add_action_record(origin, plan)
+            self._log(origin=origin, detail=f"planner action={plan.action} reason={plan.reason}")
 
             if plan.action == "reply":
-                reply_text = await self._try_generate_reply(origin, chat_type, messages, plan, provider_id)
-                if reply_text:
-                    await self._send_reply(origin, reply_text)
-                    sent_at = time.time()
-                    await self.store.save_message(
-                        NormalizedMessage(
-                            unified_msg_origin=origin,
-                            message_id=f"bot-{uuid.uuid4().hex}",
-                            sender_id="bot",
-                            sender_name="bot",
-                            self_id="bot",
-                            chat_type=chat_type,  # type: ignore[arg-type]
-                            content_text=reply_text,
-                            raw_summary=reply_text,
-                            created_at=sent_at,
-                            is_bot=True,
-                        ),
-                        self.config.max_context_messages,
-                    )
-                    await self.store.mark_reply_sent(origin, sent_at)
-                    if self.config.write_back_to_conversation:
-                        await self._write_back_to_conversation(origin, messages[-1], reply_text)
-                else:
-                    if chat_type == "group":
-                        await self.store.increment_no_reply(origin)
-                    else:
-                        await self.store.set_waiting(origin, time.time() + self.config.private_wait_default_seconds)
-                        self._arm_wait(origin, self.config.private_wait_default_seconds)
+                await self._handle_reply_plan(origin, chat_type, messages, plan, provider_id)
             elif plan.action == "wait":
                 wait_seconds = plan.wait_seconds or self.config.private_wait_default_seconds
                 await self.store.set_waiting(origin, time.time() + wait_seconds)
                 self._arm_wait(origin, wait_seconds)
+                self._log(origin=origin, detail=f"planner wait {wait_seconds}s")
             elif plan.action == "complete_talk":
                 await self.store.clear_waiting(origin)
+                self._log(origin=origin, detail="planner complete_talk")
             else:
                 await self.store.increment_no_reply(origin)
+                if chat_type == "group":
+                    await self.store.adjust_talk_frequency(origin, -0.08)
+                self._log(origin=origin, detail="planner chose no_reply")
 
         if origin in self._pending_reobserve:
             self._pending_reobserve.discard(origin)
             asyncio.create_task(self._observe(origin, chat_type, "pending"))
+
+    async def _handle_reply_plan(
+        self,
+        origin: str,
+        chat_type: str,
+        messages: list[NormalizedMessage],
+        plan: ActionPlan,
+        provider_id: str,
+    ) -> None:
+        reply_text = await self._try_generate_reply(origin, chat_type, messages, plan, provider_id)
+        if not reply_text:
+            if chat_type == "group":
+                await self.store.increment_no_reply(origin)
+                await self.store.adjust_talk_frequency(origin, -0.08)
+            else:
+                wait_seconds = self.config.private_wait_default_seconds
+                await self.store.set_waiting(origin, time.time() + wait_seconds)
+                self._arm_wait(origin, wait_seconds)
+            return
+
+        reply_hash = self._hash_reply(reply_text)
+        if chat_type == "group":
+            is_duplicate = await self.store.is_duplicate_reply(
+                origin=origin,
+                target_message_id=plan.target_message_id,
+                reply_text_hash=reply_hash,
+                now=time.time(),
+                within_seconds=self.config.duplicate_reply_window_seconds,
+            )
+            if is_duplicate:
+                await self.store.increment_no_reply(origin)
+                await self.store.adjust_talk_frequency(origin, -0.08)
+                self._log(origin=origin, detail="duplicate reply suppressed")
+                return
+
+        await self._send_reply(origin, reply_text)
+        sent_at = time.time()
+        await self.store.save_message(
+            NormalizedMessage(
+                unified_msg_origin=origin,
+                message_id=f"bot-{uuid.uuid4().hex}",
+                sender_id="bot",
+                sender_name="bot",
+                self_id="bot",
+                chat_type=chat_type,  # type: ignore[arg-type]
+                content_text=reply_text,
+                raw_summary=reply_text,
+                created_at=sent_at,
+                is_bot=True,
+            ),
+            self.config.max_context_messages,
+        )
+        await self.store.mark_reply_sent(
+            origin,
+            sent_at=sent_at,
+            target_message_id=plan.target_message_id,
+            reply_text_hash=reply_hash,
+        )
+        if chat_type == "group":
+            await self.store.adjust_talk_frequency(origin, -0.18)
+        if self.config.write_back_to_conversation:
+            target_message = self._resolve_write_back_target(messages, plan)
+            if target_message is not None:
+                await self._write_back_to_conversation(origin, target_message, reply_text)
 
     def _arm_wait(self, origin: str, wait_seconds: int) -> None:
         if origin in self._wait_tasks:
@@ -168,6 +246,7 @@ class MaiBotProactiveService:
             await asyncio.sleep(wait_seconds)
             session = await self.store.get_session(origin)
             if session.chat_type == "private":
+                self._log(origin=origin, detail="wait timeout reached, re-observing")
                 await self._schedule_observation(origin, "private", "wait-timeout")
         except asyncio.CancelledError:
             return
@@ -179,7 +258,7 @@ class MaiBotProactiveService:
         origin: str,
         chat_type: str,
         messages: list[NormalizedMessage],
-        plan: Any,
+        plan: ActionPlan,
         provider_id: str,
     ) -> str:
         persona_name = await self._get_persona_name(origin)
@@ -192,8 +271,26 @@ class MaiBotProactiveService:
                 llm_call=lambda prompt: self._llm_call(provider_id, prompt),
             )
         except Exception as exc:
-            logger.exception("Reply generation failed: %s", exc)
+            logger.exception(f"Reply generation failed: {exc}")
             return ""
+
+    def _resolve_write_back_target(
+        self,
+        messages: list[NormalizedMessage],
+        plan: ActionPlan,
+    ) -> NormalizedMessage | None:
+        if plan.target_message_id:
+            target = next((msg for msg in messages if msg.message_id == plan.target_message_id), None)
+            if target is not None and not target.is_bot:
+                return target
+        for message in reversed(messages):
+            if not message.is_bot:
+                return message
+        return None
+
+    def _hash_reply(self, reply_text: str) -> str:
+        normalized = " ".join(reply_text.strip().lower().split())
+        return hashlib.sha1(normalized.encode("utf-8")).hexdigest()
 
     async def _llm_call(self, provider_id: str, prompt: str) -> str:
         response = await self.context.llm_generate(
@@ -319,7 +416,8 @@ class MaiBotProactiveService:
         )
         is_group = bool(getattr(message_obj, "group_id", "") or getattr(event, "get_group_id", lambda: "")())
         is_bot = bool(sender_id and self_id and sender_id == self_id)
-        is_command_like = summary.strip().startswith(("/", "!", ".", "#"))
+        if is_bot:
+            return None
 
         normalized = NormalizedMessage(
             unified_msg_origin=origin,
@@ -331,10 +429,35 @@ class MaiBotProactiveService:
             content_text=message_str.strip() or summary,
             raw_summary=summary,
             created_at=float(getattr(message_obj, "timestamp", time.time()) or time.time()),
-            is_bot=is_bot,
+            is_bot=False,
             is_mentioned=is_mentioned,
-            is_command_like=is_command_like,
+            is_command_like=summary.strip().startswith(("/", "!", ".", "#")),
         )
-        if should_ignore_message(normalized, self.config) and not normalized.is_mentioned:
-            return normalized
+        normalized.is_low_signal = is_low_signal_message(normalized)
         return normalized
+
+    def _log_trigger(
+        self,
+        message: NormalizedMessage,
+        reason: str,
+        unread_count: int,
+        effective_talk_value: float,
+        heat_factor: float,
+    ) -> None:
+        if not self.config.log_decisions:
+            return
+        logger.info(
+            "[maibot_proactive] origin=%s type=%s mentioned=%s low_signal=%s unread=%s reason=%s chance=%.3f heat=%.2f",
+            message.unified_msg_origin,
+            message.chat_type,
+            message.is_mentioned,
+            message.is_low_signal,
+            unread_count,
+            reason,
+            effective_talk_value,
+            heat_factor,
+        )
+
+    def _log(self, origin: str, detail: str) -> None:
+        if self.config.log_decisions:
+            logger.info(f"[maibot_proactive] origin={origin} {detail}")

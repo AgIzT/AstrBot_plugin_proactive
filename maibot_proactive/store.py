@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from .models import ActionPlan, ActionRecord, NormalizedMessage, SessionRecord
+from .policy import clamp_talk_frequency_adjust
 
 
 class SQLiteStateStore:
@@ -33,7 +34,13 @@ class SQLiteStateStore:
                     last_active_at REAL NOT NULL DEFAULT 0,
                     consecutive_no_reply_count INTEGER NOT NULL DEFAULT 0,
                     talk_frequency_adjust REAL NOT NULL DEFAULT 1.0,
-                    state TEXT NOT NULL DEFAULT 'idle'
+                    state TEXT NOT NULL DEFAULT 'idle',
+                    last_reply_target_message_id TEXT NOT NULL DEFAULT '',
+                    last_reply_text_hash TEXT NOT NULL DEFAULT '',
+                    last_reply_at REAL NOT NULL DEFAULT 0,
+                    talk_value_override REAL NOT NULL DEFAULT -1.0,
+                    cooldown_override INTEGER NOT NULL DEFAULT -1,
+                    force_silent INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS recent_messages (
@@ -45,6 +52,7 @@ class SQLiteStateStore:
                     is_bot INTEGER NOT NULL DEFAULT 0,
                     is_mentioned INTEGER NOT NULL DEFAULT 0,
                     is_command_like INTEGER NOT NULL DEFAULT 0,
+                    is_low_signal INTEGER NOT NULL DEFAULT 0,
                     content_text TEXT NOT NULL,
                     raw_summary TEXT NOT NULL,
                     created_at REAL NOT NULL
@@ -59,6 +67,7 @@ class SQLiteStateStore:
                     action TEXT NOT NULL,
                     reason TEXT NOT NULL,
                     target_message_id TEXT NOT NULL,
+                    payload_summary TEXT NOT NULL DEFAULT '',
                     created_at REAL NOT NULL
                 );
 
@@ -66,6 +75,22 @@ class SQLiteStateStore:
                     ON action_records(unified_msg_origin, created_at);
                 """
             )
+            self._ensure_column(conn, "chat_sessions", "last_reply_target_message_id", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "chat_sessions", "last_reply_text_hash", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "chat_sessions", "last_reply_at", "REAL NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "chat_sessions", "talk_value_override", "REAL NOT NULL DEFAULT -1.0")
+            self._ensure_column(conn, "chat_sessions", "cooldown_override", "INTEGER NOT NULL DEFAULT -1")
+            self._ensure_column(conn, "chat_sessions", "force_silent", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "recent_messages", "is_low_signal", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "action_records", "payload_summary", "TEXT NOT NULL DEFAULT ''")
+
+    def _ensure_column(self, conn: sqlite3.Connection, table_name: str, column_name: str, ddl: str) -> None:
+        columns = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+        if column_name not in columns:
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}")
 
     async def upsert_session(self, message: NormalizedMessage) -> SessionRecord:
         return await asyncio.to_thread(self._upsert_session_sync, message)
@@ -76,8 +101,10 @@ class SQLiteStateStore:
                 """
                 INSERT INTO chat_sessions (
                     unified_msg_origin, chat_type, enabled, last_read_at,
-                    last_active_at, consecutive_no_reply_count, talk_frequency_adjust, state
-                ) VALUES (?, ?, 1, 0, 0, 0, 1.0, 'idle')
+                    last_active_at, consecutive_no_reply_count, talk_frequency_adjust, state,
+                    last_reply_target_message_id, last_reply_text_hash, last_reply_at,
+                    talk_value_override, cooldown_override, force_silent
+                ) VALUES (?, ?, 1, 0, 0, 0, 1.0, 'idle', '', '', 0, -1.0, -1, 0)
                 ON CONFLICT(unified_msg_origin) DO UPDATE SET
                     chat_type = excluded.chat_type
                 """,
@@ -103,8 +130,10 @@ class SQLiteStateStore:
                     """
                     INSERT INTO chat_sessions (
                         unified_msg_origin, chat_type, enabled, last_read_at,
-                        last_active_at, consecutive_no_reply_count, talk_frequency_adjust, state
-                    ) VALUES (?, ?, 1, 0, 0, 0, 1.0, 'idle')
+                        last_active_at, consecutive_no_reply_count, talk_frequency_adjust, state,
+                        last_reply_target_message_id, last_reply_text_hash, last_reply_at,
+                        talk_value_override, cooldown_override, force_silent
+                    ) VALUES (?, ?, 1, 0, 0, 0, 1.0, 'idle', '', '', 0, -1.0, -1, 0)
                     """,
                     (origin, chat_type or "group"),
                 )
@@ -124,8 +153,8 @@ class SQLiteStateStore:
                 """
                 INSERT INTO recent_messages (
                     message_id, unified_msg_origin, sender_id, sender_name, is_bot,
-                    is_mentioned, is_command_like, content_text, raw_summary, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    is_mentioned, is_command_like, is_low_signal, content_text, raw_summary, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message.message_id,
@@ -135,6 +164,7 @@ class SQLiteStateStore:
                     int(message.is_bot),
                     int(message.is_mentioned),
                     int(message.is_command_like),
+                    int(message.is_low_signal),
                     message.content_text,
                     message.raw_summary,
                     message.created_at,
@@ -152,6 +182,34 @@ class SQLiteStateStore:
                 """,
                 (message.unified_msg_origin, keep_count),
             )
+
+    async def has_recent_duplicate_message(
+        self,
+        message: NormalizedMessage,
+        within_seconds: int = 30,
+    ) -> bool:
+        return await asyncio.to_thread(self._has_recent_duplicate_message_sync, message, within_seconds)
+
+    def _has_recent_duplicate_message_sync(self, message: NormalizedMessage, within_seconds: int) -> bool:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM recent_messages
+                WHERE unified_msg_origin = ?
+                  AND sender_id = ?
+                  AND is_bot = 0
+                  AND raw_summary = ?
+                  AND created_at >= ?
+                """,
+                (
+                    message.unified_msg_origin,
+                    message.sender_id,
+                    message.raw_summary,
+                    message.created_at - within_seconds,
+                ),
+            ).fetchone()
+        return bool(row and int(row["cnt"]) > 0)
 
     async def get_recent_messages(self, origin: str, limit: int) -> list[NormalizedMessage]:
         return await asyncio.to_thread(self._get_recent_messages_sync, origin, limit)
@@ -185,6 +243,7 @@ class SQLiteStateStore:
                   AND created_at > ?
                   AND is_bot = 0
                   AND is_command_like = 0
+                  AND is_low_signal = 0
                 """,
                 (origin, since),
             ).fetchone()
@@ -194,14 +253,15 @@ class SQLiteStateStore:
         await asyncio.to_thread(self._add_action_record_sync, origin, plan, created_at or time.time())
 
     def _add_action_record_sync(self, origin: str, plan: ActionPlan, created_at: float) -> None:
+        payload_summary = self._build_payload_summary(plan)
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO action_records (
-                    unified_msg_origin, action, reason, target_message_id, created_at
-                ) VALUES (?, ?, ?, ?, ?)
+                    unified_msg_origin, action, reason, target_message_id, payload_summary, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (origin, plan.action, plan.reason, plan.target_message_id, created_at),
+                (origin, plan.action, plan.reason, plan.target_message_id, payload_summary, created_at),
             )
             conn.execute(
                 """
@@ -216,6 +276,18 @@ class SQLiteStateStore:
                 (origin,),
             )
 
+    def _build_payload_summary(self, plan: ActionPlan) -> str:
+        parts: list[str] = []
+        if plan.question:
+            parts.append(f"question={plan.question}")
+        if plan.unknown_words:
+            parts.append(f"unknown={','.join(plan.unknown_words[:3])}")
+        if plan.quote:
+            parts.append("quote=true")
+        if plan.wait_seconds:
+            parts.append(f"wait={plan.wait_seconds}")
+        return "; ".join(parts)
+
     async def get_recent_actions(self, origin: str, limit: int = 5) -> list[ActionRecord]:
         return await asyncio.to_thread(self._get_recent_actions_sync, origin, limit)
 
@@ -223,7 +295,7 @@ class SQLiteStateStore:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT action, reason, target_message_id, created_at
+                SELECT action, reason, target_message_id, payload_summary, created_at
                 FROM action_records
                 WHERE unified_msg_origin = ?
                 ORDER BY created_at DESC
@@ -236,6 +308,7 @@ class SQLiteStateStore:
                 action=row["action"],
                 reason=row["reason"],
                 target_message_id=row["target_message_id"],
+                payload_summary=str(row["payload_summary"] or ""),
                 created_at=float(row["created_at"]),
             )
             for row in rows
@@ -251,18 +324,41 @@ class SQLiteStateStore:
                 (observed_at, origin),
             )
 
-    async def mark_reply_sent(self, origin: str, sent_at: float | None = None) -> None:
-        await asyncio.to_thread(self._mark_reply_sent_sync, origin, sent_at or time.time())
+    async def mark_reply_sent(
+        self,
+        origin: str,
+        sent_at: float | None = None,
+        target_message_id: str = "",
+        reply_text_hash: str = "",
+    ) -> None:
+        await asyncio.to_thread(
+            self._mark_reply_sent_sync,
+            origin,
+            sent_at or time.time(),
+            target_message_id,
+            reply_text_hash,
+        )
 
-    def _mark_reply_sent_sync(self, origin: str, sent_at: float) -> None:
+    def _mark_reply_sent_sync(
+        self,
+        origin: str,
+        sent_at: float,
+        target_message_id: str,
+        reply_text_hash: str,
+    ) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
                 UPDATE chat_sessions
-                SET last_active_at = ?, consecutive_no_reply_count = 0, state = 'idle'
+                SET last_active_at = ?,
+                    consecutive_no_reply_count = 0,
+                    state = 'idle',
+                    last_reply_target_message_id = ?,
+                    last_reply_text_hash = ?,
+                    last_reply_at = ?
                 WHERE unified_msg_origin = ?
                 """,
-                (sent_at, origin),
+                (sent_at, target_message_id, reply_text_hash, sent_at, origin),
             )
 
     async def increment_no_reply(self, origin: str) -> None:
@@ -278,6 +374,66 @@ class SQLiteStateStore:
                 """,
                 (origin,),
             )
+
+    async def adjust_talk_frequency(self, origin: str, delta: float) -> float:
+        return await asyncio.to_thread(self._adjust_talk_frequency_sync, origin, delta)
+
+    def _adjust_talk_frequency_sync(self, origin: str, delta: float) -> float:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT talk_frequency_adjust FROM chat_sessions WHERE unified_msg_origin = ?",
+                (origin,),
+            ).fetchone()
+            current = float(row["talk_frequency_adjust"]) if row else 1.0
+            updated = clamp_talk_frequency_adjust(current + delta)
+            conn.execute(
+                "UPDATE chat_sessions SET talk_frequency_adjust = ? WHERE unified_msg_origin = ?",
+                (updated, origin),
+            )
+        return updated
+
+    async def is_duplicate_reply(
+        self,
+        origin: str,
+        target_message_id: str,
+        reply_text_hash: str,
+        now: float,
+        within_seconds: int,
+    ) -> bool:
+        return await asyncio.to_thread(
+            self._is_duplicate_reply_sync,
+            origin,
+            target_message_id,
+            reply_text_hash,
+            now,
+            within_seconds,
+        )
+
+    def _is_duplicate_reply_sync(
+        self,
+        origin: str,
+        target_message_id: str,
+        reply_text_hash: str,
+        now: float,
+        within_seconds: int,
+    ) -> bool:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT last_reply_target_message_id, last_reply_text_hash, last_reply_at
+                FROM chat_sessions
+                WHERE unified_msg_origin = ?
+                """,
+                (origin,),
+            ).fetchone()
+        if row is None:
+            return False
+        last_reply_at = float(row["last_reply_at"] or 0)
+        if not last_reply_at or (now - last_reply_at) > within_seconds:
+            return False
+        if target_message_id and str(row["last_reply_target_message_id"] or "") == target_message_id:
+            return True
+        return bool(reply_text_hash and str(row["last_reply_text_hash"] or "") == reply_text_hash)
 
     async def set_waiting(self, origin: str, wake_at: float) -> None:
         await asyncio.to_thread(self._set_waiting_sync, origin, wake_at)
@@ -309,6 +465,12 @@ class SQLiteStateStore:
             consecutive_no_reply_count=int(row["consecutive_no_reply_count"]),
             talk_frequency_adjust=float(row["talk_frequency_adjust"]),
             state=str(row["state"]),
+            last_reply_target_message_id=str(row["last_reply_target_message_id"] or ""),
+            last_reply_text_hash=str(row["last_reply_text_hash"] or ""),
+            last_reply_at=float(row["last_reply_at"] or 0),
+            talk_value_override=float(row["talk_value_override"] or -1.0),
+            cooldown_override=int(row["cooldown_override"] or -1),
+            force_silent=bool(row["force_silent"]),
         )
 
     def _row_to_message(self, origin: str, row: sqlite3.Row) -> NormalizedMessage:
@@ -326,4 +488,5 @@ class SQLiteStateStore:
             is_bot=bool(row["is_bot"]),
             is_mentioned=bool(row["is_mentioned"]),
             is_command_like=bool(row["is_command_like"]),
+            is_low_signal=bool(row["is_low_signal"]),
         )

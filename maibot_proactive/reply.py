@@ -56,7 +56,7 @@ class ReplyEngine:
             f"Planner reason: {plan.reason}\n"
             f"Triggered message: {target_block}\n"
             f"Search hint: {plan.question or 'none'}\n"
-            f"Unknown words: {', '.join(plan.unknown_words) if plan.unknown_words else 'none'}\n"
+            f"Unknown words: {', '.join(plan.unknown_words) if plan.unknown_words else 'none'}\n\n"
             f"Recent chat messages:\n{prompt_messages}\n\n"
             f"Reply style: {reply_style}\n"
             "Constraints:\n"
