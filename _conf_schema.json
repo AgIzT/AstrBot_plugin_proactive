@@ -125,9 +125,9 @@
     "default": 1.35
   },
   "whitelist_origins": {
-    "description": "鐧藉悕鍗曚細璇濆垪琛?",
+    "description": "白名单会话列表",
     "type": "list",
-    "hint": "濡傛灉姝ゅ垪琛ㄦ湁鍐呭锛屾彃浠跺皢鍙湪杩欎簺 unified_msg_origin 涓敓鏁堬紱姝ゆ椂榛戝悕鍗曚笉鍐嶅弬涓庡垽瀹氥€?",
+    "hint": "如果此列表有内容，插件将只在这些 unified_msg_origin 中生效；此时黑名单不再参与判定。",
     "default": []
   },
   "blocked_origins": {
