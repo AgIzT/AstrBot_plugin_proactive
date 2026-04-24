@@ -95,8 +95,16 @@ pip install -r requirements.txt
 - `private_wait_default_seconds`
 - `max_context_messages`
 - `write_back_to_conversation`
+- `avoid_core_duplicate_replies`
+- `enable_private_proactive_takeover`
 - `ignore_command_like_messages`
 - `blocked_origins`
+
+行为说明：
+
+- `avoid_core_duplicate_replies` 默认开启，用来避让 AstrBot 核心已经会直接回复的 `@bot`、唤醒词和默认私聊场景。
+- `enable_private_proactive_takeover` 默认关闭；开启后私聊会恢复为插件 planner 接管的 `reply / wait / complete_talk` 流程。
+- 主动回复发送日志由插件在 `_send_reply()` 中记录；`write_back_to_conversation` 只负责把问答写入 AstrBot 对话历史，不等同于平台发送日志。
 
 节奏配置：
 

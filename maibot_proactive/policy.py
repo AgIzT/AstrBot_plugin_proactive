@@ -90,6 +90,9 @@ def compute_group_trigger(
         return _decision(False, "force-silent", snapshot)
     if config.enable_session_overrides and not session.enabled:
         return _decision(False, "session-disabled", snapshot)
+    if config.avoid_core_duplicate_replies and message.is_core_wake_message:
+        snapshot.reason_tags.append("core-wake")
+        return _decision(False, "core-wake-skipped", snapshot)
     if message.is_mentioned and config.mention_force_reply:
         snapshot.reason_tags.append("mentioned")
         return _decision(True, "mentioned", snapshot, probability_hit=True)
@@ -129,6 +132,8 @@ def should_observe_private(
         return TriggerDecision(False, "force-silent")
     if session and config.enable_session_overrides and not session.enabled:
         return TriggerDecision(False, "session-disabled")
+    if config.avoid_core_duplicate_replies and not config.enable_private_proactive_takeover:
+        return TriggerDecision(False, "private-core-skipped")
     return TriggerDecision(True, "private-message")
 
 

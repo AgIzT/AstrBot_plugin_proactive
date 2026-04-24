@@ -360,7 +360,22 @@ class MaiBotProactiveService:
 
     async def _send_reply(self, origin: str, reply_text: str) -> None:
         chain = MessageChain().message(reply_text)
-        await self.context.send_message(origin, chain)
+        summary = self._summarize_reply(reply_text)
+        try:
+            sent = await self.context.send_message(origin, chain)
+        except Exception:
+            logger.exception("[maibot_proactive] send failed origin=%s text=%s", origin, summary)
+            raise
+        if not sent:
+            logger.error("[maibot_proactive] send failed origin=%s text=%s reason=platform-not-found", origin, summary)
+            raise RuntimeError(f"proactive reply was not sent for origin {origin}")
+        logger.info("[maibot_proactive] send success origin=%s text=%s", origin, summary)
+
+    def _summarize_reply(self, reply_text: str, limit: int = 120) -> str:
+        summary = " ".join(reply_text.strip().split())
+        if len(summary) <= limit:
+            return summary
+        return summary[: limit - 3] + "..."
 
     async def _write_back_to_conversation(
         self,
@@ -465,6 +480,7 @@ class MaiBotProactiveService:
             is_bot=False,
             is_mentioned=is_mentioned,
             is_command_like=summary.strip().startswith(("/", "!", ".", "#")),
+            is_core_wake_message=bool(getattr(event, "is_at_or_wake_command", False)),
         )
         normalized.is_low_signal = is_low_signal_message(normalized)
         return normalized

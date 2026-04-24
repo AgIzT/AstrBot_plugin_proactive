@@ -19,6 +19,8 @@ class PluginConfig:
     write_back_to_conversation: bool = True
     ignore_command_like_messages: bool = True
     enable_session_overrides: bool = True
+    avoid_core_duplicate_replies: bool = True
+    enable_private_proactive_takeover: bool = False
     duplicate_reply_window_seconds: int = 180
     log_decisions: bool = True
     ignore_low_signal_messages: bool = True
@@ -53,6 +55,8 @@ class PluginConfig:
         self.write_back_to_conversation = bool(cfg.get("write_back_to_conversation", True))
         self.ignore_command_like_messages = bool(cfg.get("ignore_command_like_messages", True))
         self.enable_session_overrides = bool(cfg.get("enable_session_overrides", True))
+        self.avoid_core_duplicate_replies = bool(cfg.get("avoid_core_duplicate_replies", True))
+        self.enable_private_proactive_takeover = bool(cfg.get("enable_private_proactive_takeover", False))
         self.duplicate_reply_window_seconds = max(
             1,
             int(cfg.get("duplicate_reply_window_seconds", 180) or 180),

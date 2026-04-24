@@ -52,6 +52,24 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(decision.reason, "mentioned")
         self.assertTrue(decision.probability_hit)
 
+    def test_group_core_wake_message_is_skipped_by_default(self):
+        cfg = PluginConfig(DummyConfig())
+        session = SessionRecord("onebot:group:123", "group")
+        msg = build_message(is_mentioned=True, is_core_wake_message=True)
+        stats = GroupPacingStats(unread_human_messages=1, recent_activity_messages=1)
+        decision = compute_group_trigger(msg, session, stats, cfg, random_value=0.0, now=1000.0)
+        self.assertFalse(decision.should_observe)
+        self.assertEqual(decision.reason, "core-wake-skipped")
+
+    def test_group_core_wake_message_can_bypass_avoidance(self):
+        cfg = PluginConfig(DummyConfig({"avoid_core_duplicate_replies": False}))
+        session = SessionRecord("onebot:group:123", "group")
+        msg = build_message(is_mentioned=True, is_core_wake_message=True)
+        stats = GroupPacingStats(unread_human_messages=1, recent_activity_messages=1)
+        decision = compute_group_trigger(msg, session, stats, cfg, random_value=0.99, now=1000.0)
+        self.assertTrue(decision.should_observe)
+        self.assertEqual(decision.reason, "mentioned")
+
     def test_group_backoff_requires_more_unread_messages(self):
         cfg = PluginConfig(DummyConfig())
         session = SessionRecord("onebot:group:123", "group", consecutive_no_reply_count=5)
@@ -72,8 +90,15 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(decision.reason, "cooldown")
         self.assertTrue(decision.cooldown_hit)
 
-    def test_private_always_observes_normal_message(self):
+    def test_private_skips_normal_message_by_default(self):
         cfg = PluginConfig(DummyConfig())
+        msg = build_message(chat_type="private", unified_msg_origin="onebot:private:1")
+        decision = should_observe_private(msg, cfg)
+        self.assertFalse(decision.should_observe)
+        self.assertEqual(decision.reason, "private-core-skipped")
+
+    def test_private_takeover_observes_normal_message(self):
+        cfg = PluginConfig(DummyConfig({"enable_private_proactive_takeover": True}))
         msg = build_message(chat_type="private", unified_msg_origin="onebot:private:1")
         decision = should_observe_private(msg, cfg)
         self.assertTrue(decision.should_observe)

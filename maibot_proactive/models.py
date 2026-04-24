@@ -22,6 +22,7 @@ class NormalizedMessage:
     is_mentioned: bool = False
     is_command_like: bool = False
     is_low_signal: bool = False
+    is_core_wake_message: bool = False
 
 
 @dataclass(slots=True)

@@ -66,6 +66,18 @@
     "hint": "允许单个会话覆盖全局节奏配置。",
     "default": true
   },
+  "avoid_core_duplicate_replies": {
+    "description": "避让 AstrBot 核心直接回复",
+    "type": "bool",
+    "hint": "开启后，@bot、唤醒词和默认私聊回复等核心会自然响应的场景不会再额外触发本插件主动回复。",
+    "default": true
+  },
+  "enable_private_proactive_takeover": {
+    "description": "启用私聊主动接管",
+    "type": "bool",
+    "hint": "默认关闭以避免和 AstrBot 私聊默认回复重复；开启后私聊会进入本插件 planner 的 reply/wait/complete_talk 流程。",
+    "default": false
+  },
   "duplicate_reply_window_seconds": {
     "description": "重复回复抑制窗口秒数",
     "type": "int",
